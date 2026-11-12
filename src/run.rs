@@ -27,9 +27,6 @@ pub async fn run(
             .await
             .map_err(|err| RunError::Model(err.to_string()))?;
         completed += 1;
-        if reporter.client_gone() {
-            return Err(RunError::Disconnected);
-        }
         let finish = turn.finish_reason;
         let calls = turn.message.tool_calls.clone();
         writer
@@ -51,18 +48,17 @@ pub async fn run(
                 rejected(&call, "credential rejected", true)
             } else {
                 let arguments = serde_json::to_string(&call.arguments).unwrap_or_else(|_| "null".to_string());
-                reporter
-                    .on_tool_call(&call.id, &call.name, &arguments)
-                    .await
-                    .map_err(|_| RunError::Disconnected)?;
+                reporter.on_tool_call(&call.id, &call.name, &arguments);
                 let response = runner.execute(&call).await;
                 if response.credential_failure {
                     credential_failed = true;
                 }
-                reporter
-                    .on_tool_result(&response.call_id, &response.name, &response.output, response.is_error)
-                    .await
-                    .map_err(|_| RunError::Disconnected)?;
+                reporter.on_tool_result(
+                    &response.call_id,
+                    &response.name,
+                    &response.output,
+                    response.is_error,
+                );
                 response
             };
             let tool_message = Message {

@@ -11,7 +11,6 @@ pub enum StopReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunError {
     Model(String),
-    Disconnected,
     Persist(String),
 }
 
@@ -19,7 +18,6 @@ impl fmt::Display for RunError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Model(message) | Self::Persist(message) => write!(f, "{message}"),
-            Self::Disconnected => write!(f, "client disconnected"),
         }
     }
 }

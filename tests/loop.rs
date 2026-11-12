@@ -50,7 +50,6 @@ where
 
 struct RecReporter {
     events: Mutex<Vec<String>>,
-    gone: bool,
 }
 
 impl Reporter for RecReporter {
@@ -58,18 +57,12 @@ impl Reporter for RecReporter {
         Box::new(Sink)
     }
 
-    fn on_tool_call(&self, id: &str, name: &str, arguments: &str) -> agent_runtime::ReportFuture<'_> {
+    fn on_tool_call(&self, id: &str, name: &str, arguments: &str) {
         self.events.lock().unwrap().push(format!("call:{id}:{name}:{arguments}"));
-        Box::pin(async { Ok(()) })
     }
 
-    fn on_tool_result(&self, id: &str, name: &str, result: &str, is_error: bool) -> agent_runtime::ReportFuture<'_> {
+    fn on_tool_result(&self, id: &str, name: &str, result: &str, is_error: bool) {
         self.events.lock().unwrap().push(format!("result:{id}:{name}:{result}:{is_error}"));
-        Box::pin(async { Ok(()) })
-    }
-
-    fn client_gone(&self) -> bool {
-        self.gone
     }
 }
 
@@ -159,7 +152,6 @@ fn harness(turns: Vec<ModelTurn>, respond: fn(&ToolCall) -> ToolResponse) -> Har
         },
         reporter: RecReporter {
             events: Mutex::new(Vec::new()),
-            gone: false,
         },
         writer: RecWriter {
             assistants: Mutex::new(Vec::new()),
@@ -334,26 +326,6 @@ async fn a_writer_failure_is_returned_to_the_caller() {
     .unwrap_err();
 
     assert_eq!(error, RunError::Persist("run lock lost".to_string()));
-}
-
-#[tokio::test]
-async fn a_disconnected_client_stops_before_the_transcript_is_written() {
-    let mut harness = harness(vec![turn("hello", ModelFinish::Stop, vec![])], ok);
-    harness.reporter.gone = true;
-    let error = agent_runtime::run(
-        &harness.script,
-        &harness.runner,
-        vec![],
-        vec![],
-        &harness.reporter,
-        &harness.writer,
-        DEFAULT_MAX_TURNS,
-    )
-    .await
-    .unwrap_err();
-
-    assert_eq!(error, RunError::Disconnected);
-    assert!(harness.writer.assistants.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
