@@ -2,7 +2,10 @@ use std::sync::Mutex;
 
 use agent_llm::message::{Message, Role, ToolCall, ToolDefinition};
 use agent_llm::types::{GenerateFuture, LLMProvider, ModelFinish, ModelTurn, TextSink, Usage};
-use agent_runtime::{Reporter, RunError, StopReason, ToolFuture, ToolResponse, ToolRunner, TranscriptWriter, DEFAULT_MAX_TURNS};
+use agent_runtime::{
+    ConversationContext, ReactRuntime, Reporter, RunError, RunInput, Runtime, StopReason, ToolFuture, ToolResponse, ToolRunner,
+    TranscriptWriter, DEFAULT_MAX_TURNS,
+};
 
 struct Sink;
 
@@ -41,7 +44,9 @@ impl<F> ToolRunner for FnRunner<F>
 where
     F: Fn(&ToolCall) -> ToolResponse + Send + Sync,
 {
-    fn execute<'a>(&'a self, call: &'a ToolCall) -> ToolFuture<'a> {
+    type Scope = ();
+
+    fn execute<'a>(&'a self, _scope: &'a Self::Scope, call: &'a ToolCall) -> ToolFuture<'a> {
         self.hits.lock().unwrap().push(call.name.clone());
         let response = (self.respond)(call);
         Box::pin(async move { response })
@@ -73,8 +78,11 @@ struct RecWriter {
 }
 
 impl TranscriptWriter for RecWriter {
+    type Scope = ();
+
     fn on_assistant<'a>(
         &'a self,
+        _scope: &'a Self::Scope,
         message: &'a Message,
         finish_reason: &'a str,
         _usage: Option<&'a Usage>,
@@ -87,19 +95,18 @@ impl TranscriptWriter for RecWriter {
         Box::pin(async { Ok(()) })
     }
 
-    fn on_tool<'a>(&'a self, message: &'a Message, is_error: bool) -> agent_runtime::WriteFuture<'a> {
+    fn on_tool<'a>(&'a self, _scope: &'a Self::Scope, message: &'a Message, is_error: bool) -> agent_runtime::WriteFuture<'a> {
         self.tools.lock().unwrap().push((message.tool_call_id.clone(), message.content.clone(), is_error));
         Box::pin(async { Ok(()) })
     }
 }
 
-fn user(content: &str) -> Message {
-    Message {
-        role: Role::User,
-        content: content.to_string(),
-        tool_calls: Vec::new(),
-        tool_call_id: String::new(),
+fn started(user_text: Option<&str>) -> ConversationContext {
+    let mut context = ConversationContext::new();
+    if let Some(text) = user_text {
+        context.append_user(text);
     }
+    context
 }
 
 fn call(name: &str, arguments: serde_json::Value) -> ToolCall {
@@ -165,20 +172,29 @@ fn ok(call: &ToolCall) -> ToolResponse {
     response(call, "ok", false, false)
 }
 
+async fn drive(
+    max_turns: u32,
+    harness: &Harness,
+    model: &dyn LLMProvider,
+    context: &mut ConversationContext,
+) -> Result<StopReason, RunError> {
+    let runtime = ReactRuntime::new(max_turns, &harness.runner, &harness.writer);
+    runtime
+        .run(RunInput {
+            model,
+            context,
+            tools: vec![],
+            reporter: &harness.reporter,
+            scope: &(),
+        })
+        .await
+}
+
 #[tokio::test]
 async fn a_stop_finish_ends_without_calling_tools() {
     let harness = harness(vec![turn("hello", ModelFinish::Stop, vec![])], ok);
-    let reason = agent_runtime::run(
-        &harness.script,
-        &harness.runner,
-        vec![user("hi")],
-        vec![],
-        &harness.reporter,
-        &harness.writer,
-        DEFAULT_MAX_TURNS,
-    )
-    .await
-    .unwrap();
+    let mut context = started(Some("hi"));
+    let reason = drive(DEFAULT_MAX_TURNS, &harness, &harness.script, &mut context).await.unwrap();
 
     assert_eq!(reason, StopReason::Stop);
     assert!(harness.runner.hits.lock().unwrap().is_empty());
@@ -200,17 +216,8 @@ async fn a_tool_round_returns_to_the_model_and_then_stops() {
             }
         },
     );
-    let reason = agent_runtime::run(
-        &harness.script,
-        &harness.runner,
-        vec![user("hi")],
-        vec![],
-        &harness.reporter,
-        &harness.writer,
-        DEFAULT_MAX_TURNS,
-    )
-    .await
-    .unwrap();
+    let mut context = started(Some("hi"));
+    let reason = drive(DEFAULT_MAX_TURNS, &harness, &harness.script, &mut context).await.unwrap();
 
     assert_eq!(reason, StopReason::Stop);
     assert_eq!(harness.runner.hits.lock().unwrap().as_slice(), ["plain", "next"]);
@@ -220,6 +227,18 @@ async fn a_tool_round_returns_to_the_model_and_then_stops() {
     assert_eq!(seen[1][2].tool_call_id, "plain");
     assert_eq!(seen[1][2].content, "invalid time range");
     assert_eq!(seen[1][3].tool_call_id, "next");
+    let stored = context.messages();
+    assert_eq!(stored.len(), 5);
+    assert_eq!(stored[0].role, Role::User);
+    assert_eq!(stored[0].content, "hi");
+    assert_eq!(stored[1].role, Role::Assistant);
+    assert_eq!(stored[1].tool_calls.len(), 2);
+    assert_eq!(stored[2].role, Role::Tool);
+    assert_eq!(stored[2].tool_call_id, "plain");
+    assert_eq!(stored[2].content, "invalid time range");
+    assert_eq!(stored[3].tool_call_id, "next");
+    assert_eq!(stored[4].role, Role::Assistant);
+    assert_eq!(stored[4].content, "done");
     assert_eq!(harness.reporter.events.lock().unwrap().as_slice(), [
         "call:plain:plain:{}".to_string(),
         "result:plain:plain:invalid time range:true".to_string(),
@@ -229,22 +248,80 @@ async fn a_tool_round_returns_to_the_model_and_then_stops() {
 }
 
 #[tokio::test]
+async fn the_caller_scope_is_forwarded_unchanged() {
+    struct Recording {
+        seen: Mutex<Vec<String>>,
+    }
+
+    impl ToolRunner for Recording {
+        type Scope = String;
+
+        fn execute<'a>(&'a self, scope: &'a Self::Scope, call: &'a ToolCall) -> ToolFuture<'a> {
+            self.seen.lock().unwrap().push(format!("{scope}:{}", call.name));
+            let response = ok(call);
+            Box::pin(async move { response })
+        }
+    }
+
+    struct RecordingWriter {
+        seen: Mutex<Vec<String>>,
+    }
+
+    impl TranscriptWriter for RecordingWriter {
+        type Scope = String;
+
+        fn on_assistant<'a>(
+            &'a self,
+            _scope: &'a Self::Scope,
+            _message: &'a Message,
+            _finish_reason: &'a str,
+            _usage: Option<&'a Usage>,
+        ) -> agent_runtime::WriteFuture<'a> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn on_tool<'a>(&'a self, scope: &'a Self::Scope, message: &'a Message, _is_error: bool) -> agent_runtime::WriteFuture<'a> {
+            self.seen.lock().unwrap().push(format!("{scope}:{}", message.tool_call_id));
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    let runner = Recording { seen: Mutex::new(Vec::new()) };
+    let writer = RecordingWriter { seen: Mutex::new(Vec::new()) };
+    let script = Script {
+        turns: Mutex::new(vec![
+            turn("", ModelFinish::ToolCalls, vec![call("plain", serde_json::json!({}))]),
+            turn("done", ModelFinish::Stop, vec![]),
+        ]),
+        seen: Mutex::new(Vec::new()),
+    };
+    let reporter = RecReporter { events: Mutex::new(Vec::new()) };
+    let runtime = ReactRuntime::new(DEFAULT_MAX_TURNS, &runner, &writer);
+    let mut context = started(None);
+    let scope = "session-a".to_string();
+    runtime
+        .run(RunInput {
+            model: &script,
+            context: &mut context,
+            tools: vec![],
+            reporter: &reporter,
+            scope: &scope,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(runner.seen.lock().unwrap().as_slice(), ["session-a:plain".to_string()]);
+    assert_eq!(writer.seen.lock().unwrap().as_slice(), ["session-a:plain".to_string()]);
+}
+
+#[tokio::test]
 async fn credential_failure_skips_later_tools_and_stops() {
     let harness = harness(
         vec![turn("", ModelFinish::ToolCalls, vec![call("denied", serde_json::json!({})), call("next", serde_json::json!({}))])],
         |call| response(call, "登录已失效", true, true),
     );
-    let reason = agent_runtime::run(
-        &harness.script,
-        &harness.runner,
-        vec![],
-        vec![],
-        &harness.reporter,
-        &harness.writer,
-        DEFAULT_MAX_TURNS,
-    )
-    .await
-    .unwrap();
+    let mut context = started(None);
+    let reason = drive(DEFAULT_MAX_TURNS, &harness, &harness.script, &mut context).await.unwrap();
 
     assert_eq!(reason, StopReason::Credential);
     assert_eq!(harness.runner.hits.lock().unwrap().as_slice(), ["denied"]);
@@ -269,17 +346,8 @@ async fn the_turn_limit_stops_before_another_model_call() {
         ],
         ok,
     );
-    let reason = agent_runtime::run(
-        &harness.script,
-        &harness.runner,
-        vec![],
-        vec![],
-        &harness.reporter,
-        &harness.writer,
-        1,
-    )
-    .await
-    .unwrap();
+    let mut context = started(None);
+    let reason = drive(1, &harness, &harness.script, &mut context).await.unwrap();
 
     assert_eq!(reason, StopReason::MaxSteps);
     assert_eq!(harness.script.seen.lock().unwrap().len(), 1);
@@ -292,17 +360,8 @@ async fn a_length_finish_returns_without_executing_tools() {
         vec![turn("cut", ModelFinish::Length, vec![call("once", serde_json::json!({}))])],
         ok,
     );
-    let reason = agent_runtime::run(
-        &harness.script,
-        &harness.runner,
-        vec![],
-        vec![],
-        &harness.reporter,
-        &harness.writer,
-        DEFAULT_MAX_TURNS,
-    )
-    .await
-    .unwrap();
+    let mut context = started(None);
+    let reason = drive(DEFAULT_MAX_TURNS, &harness, &harness.script, &mut context).await.unwrap();
 
     assert_eq!(reason, StopReason::Length);
     assert!(harness.runner.hits.lock().unwrap().is_empty());
@@ -313,17 +372,8 @@ async fn a_length_finish_returns_without_executing_tools() {
 async fn a_writer_failure_is_returned_to_the_caller() {
     let mut harness = harness(vec![turn("hello", ModelFinish::Stop, vec![])], ok);
     harness.writer.fail_assistant = Some("run lock lost".to_string());
-    let error = agent_runtime::run(
-        &harness.script,
-        &harness.runner,
-        vec![],
-        vec![],
-        &harness.reporter,
-        &harness.writer,
-        DEFAULT_MAX_TURNS,
-    )
-    .await
-    .unwrap_err();
+    let mut context = started(None);
+    let error = drive(DEFAULT_MAX_TURNS, &harness, &harness.script, &mut context).await.unwrap_err();
 
     assert_eq!(error, RunError::Persist("run lock lost".to_string()));
 }
@@ -337,17 +387,8 @@ async fn a_non_object_argument_skips_the_runner_and_returns_to_the_model() {
         ],
         ok,
     );
-    let reason = agent_runtime::run(
-        &harness.script,
-        &harness.runner,
-        vec![],
-        vec![],
-        &harness.reporter,
-        &harness.writer,
-        DEFAULT_MAX_TURNS,
-    )
-    .await
-    .unwrap();
+    let mut context = started(None);
+    let reason = drive(DEFAULT_MAX_TURNS, &harness, &harness.script, &mut context).await.unwrap();
 
     assert_eq!(reason, StopReason::Stop);
     assert!(harness.runner.hits.lock().unwrap().is_empty());
@@ -378,9 +419,8 @@ async fn a_model_error_is_returned_to_the_caller() {
     }
 
     let harness = harness(vec![], ok);
-    let error = agent_runtime::run(&Down, &harness.runner, vec![], vec![], &harness.reporter, &harness.writer, DEFAULT_MAX_TURNS)
-        .await
-        .unwrap_err();
+    let mut context = started(None);
+    let error = drive(DEFAULT_MAX_TURNS, &harness, &Down, &mut context).await.unwrap_err();
 
     assert_eq!(error, RunError::Model("request error: down".to_string()));
 }

@@ -15,5 +15,18 @@ pub struct ToolResponse {
 pub type ToolFuture<'a> = Pin<Box<dyn Future<Output = ToolResponse> + Send + 'a>>;
 
 pub trait ToolRunner: Send + Sync {
-    fn execute<'a>(&'a self, call: &'a ToolCall) -> ToolFuture<'a>;
+    type Scope: Send + Sync;
+
+    fn execute<'a>(&'a self, scope: &'a Self::Scope, call: &'a ToolCall) -> ToolFuture<'a>;
+}
+
+impl<R> ToolRunner for &R
+where
+    R: ToolRunner + ?Sized,
+{
+    type Scope = R::Scope;
+
+    fn execute<'a>(&'a self, scope: &'a Self::Scope, call: &'a ToolCall) -> ToolFuture<'a> {
+        (*self).execute(scope, call)
+    }
 }
